@@ -1,0 +1,437 @@
+// Package sanitize provides request body sanitization for different model families.
+//
+// Android Studio's AI Agent sends requests with non-standard fields and formats
+// that some upstream models reject. This package cleans up those requests before
+// forwarding them to the upstream LLM API.
+//
+// Sanitization includes:
+//   - Stripping OpenAIAPI/models/ prefix from model field
+//   - Mapping role "developer" to "system"
+//   - Removing unsupported sampling parameters per model family
+//   - Normalizing tool_choice values
+//   - Parsing tool arguments from string to JSON object
+//   - Injecting reasoning_content from cache for multi-turn conversations
+package sanitize
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/yohanesgre/android-studio-llm-proxy/internal/cache"
+	"github.com/yohanesgre/android-studio-llm-proxy/internal/config"
+)
+
+// Result holds the sanitized body and whether the request is streaming.
+type Result struct {
+	Body     []byte
+	IsStream bool
+}
+
+const deepSeekPlaceholderReasoning = "[reasoning not provided by upstream]"
+
+// Sanitize reads a chat-completion request body, applies model-specific
+// sanitization rules, and returns the cleaned body.
+func Sanitize(r io.Reader, c cache.ReasoningCache, overrides config.ModelOverrides) (*Result, error) {
+	start := time.Now()
+	var req map[string]any
+	if err := json.NewDecoder(r).Decode(&req); err != nil {
+		return nil, fmt.Errorf("sanitize: invalid json: %w", err)
+	}
+
+	// Strip OpenAIAPI/models/ prefix from model field.
+	if model, ok := req["model"].(string); ok {
+		req["model"] = strings.TrimPrefix(model, "OpenAIAPI/models/")
+	}
+
+	// Map role "developer" → "system" in all messages.
+	if msgs, ok := req["messages"].([]any); ok {
+		for _, m := range msgs {
+			if msg, ok := m.(map[string]any); ok {
+				if role, ok := msg["role"].(string); ok && role == "developer" {
+					msg["role"] = "system"
+				}
+			}
+		}
+	}
+
+	// Detect model family and apply rules.
+	model, _ := req["model"].(string)
+	family := detectFamily(model)
+
+	// Apply per-model overrides BEFORE family rules.
+	if overrides != nil {
+		if modelOverrides, ok := overrides[model]; ok {
+			applyOverrides(req, modelOverrides)
+		}
+	}
+
+	// Normalize consistent `thinking: true/false` to provider-specific format.
+	normalizeThinking(req, family)
+
+	// Strip image URLs for models that don't support vision.
+	stripImageURLs(req, family)
+
+	applyRules(req, family)
+
+	// Inject reasoning_content from cache for assistant messages.
+	// This must happen AFTER applyRules so that DeepSeek Reasoner's
+	// stripReasoningContent runs first, then we inject the placeholder.
+	if c != nil {
+		injectReasoning(req, c, model)
+	}
+
+	isStream, _ := req["stream"].(bool)
+
+	out, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("sanitize: marshal: %w", err)
+	}
+
+	// Log sanitization duration.
+	duration := time.Since(start)
+	slog.Info("sanitize",
+		"duration_ms", float64(duration.Microseconds())/1000.0,
+		"model", model,
+	)
+
+	return &Result{Body: out, IsStream: isStream}, nil
+}
+
+type family int
+
+const (
+	familyUnknown family = iota
+	familyKimiK27
+	familyKimiK26
+	familyDeepSeekV4
+	familyDeepSeekReasoner
+	familyQwen37
+)
+
+func detectFamily(model string) family {
+	switch model {
+	case "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.7":
+		return familyKimiK27
+	case "kimi-k2.6":
+		return familyKimiK26
+	case "deepseek-v4-pro", "deepseek-v4-flash":
+		return familyDeepSeekV4
+	case "deepseek-reasoner":
+		return familyDeepSeekReasoner
+	case "qwen3.7-plus", "qwen3.7-max":
+		return familyQwen37
+	default:
+		return familyUnknown
+	}
+}
+
+func applyRules(req map[string]any, f family) {
+	thinkingDisabled := isThinkingDisabled(req)
+
+	switch f {
+	case familyKimiK27:
+		// K2.7 cannot disable thinking, always strip sampling params.
+		delete(req, "temperature")
+		delete(req, "top_p")
+		delete(req, "presence_penalty")
+		delete(req, "frequency_penalty")
+		delete(req, "n")
+		normalizeToolChoice(req)
+
+	case familyKimiK26:
+		// K2.6 can disable thinking; if so, allow sampling params.
+		if !thinkingDisabled {
+			delete(req, "temperature")
+			delete(req, "top_p")
+			delete(req, "presence_penalty")
+			delete(req, "frequency_penalty")
+			delete(req, "n")
+		}
+		normalizeToolChoice(req)
+
+	case familyDeepSeekV4:
+		if !thinkingDisabled {
+			normalizeToolChoice(req)
+		}
+
+	case familyDeepSeekReasoner:
+		normalizeToolChoice(req)
+		stripReasoningContent(req)
+
+	case familyQwen37:
+		if !thinkingDisabled {
+			normalizeToolChoice(req)
+		}
+		parseToolArguments(req)
+	}
+}
+
+// normalizeToolChoice ensures tool_choice is "auto" or "none".
+// If it's anything else (including an object or "required"), set to "auto".
+func normalizeToolChoice(req map[string]any) {
+	tc, ok := req["tool_choice"]
+	if !ok {
+		return
+	}
+	s, ok := tc.(string)
+	if ok && (s == "auto" || s == "none") {
+		return
+	}
+	req["tool_choice"] = "auto"
+}
+
+// stripReasoningContent removes reasoning_content from all input messages.
+func stripReasoningContent(req map[string]any) {
+	msgs, ok := req["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, m := range msgs {
+		if msg, ok := m.(map[string]any); ok {
+			delete(msg, "reasoning_content")
+		}
+	}
+}
+
+// parseToolArguments parses tools[].function.arguments from string to JSON object.
+func parseToolArguments(req map[string]any) {
+	tools, ok := req["tools"].([]any)
+	if !ok {
+		return
+	}
+	for _, t := range tools {
+		tool, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		args, ok := fn["arguments"]
+		if !ok {
+			continue
+		}
+		s, ok := args.(string)
+		if !ok {
+			continue
+		}
+		var parsed any
+		if err := json.Unmarshal([]byte(s), &parsed); err != nil {
+			continue // leave as-is if not valid JSON
+		}
+		fn["arguments"] = parsed
+	}
+}
+
+// injectReasoning looks up cached reasoning_content for assistant messages
+// that are missing it and injects it back.
+func injectReasoning(req map[string]any, c cache.ReasoningCache, model string) {
+	msgs, ok := req["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		// Skip if already has reasoning_content.
+		if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+			continue
+		}
+
+		content, _ := msg["content"].(string)
+		toolCalls := extractToolCalls(msg)
+
+		reasoning, found := c.Find(content, toolCalls)
+		if !found {
+			if isDeepSeekModel(model) {
+				slog.Warn("injecting placeholder reasoning_content for DeepSeek",
+					"model", model,
+					"content_len", len(content),
+					"has_tool_calls", len(toolCalls) > 0,
+				)
+				msg["reasoning_content"] = deepSeekPlaceholderReasoning
+			} else {
+				slog.Warn("reasoning_content missing and not in cache",
+					"model", model,
+					"content_len", len(content),
+					"has_tool_calls", len(toolCalls) > 0,
+				)
+			}
+			continue
+		}
+		msg["reasoning_content"] = reasoning
+	}
+}
+
+// extractToolCalls extracts tool calls from a message map into cache.ToolCall slice.
+func extractToolCalls(msg map[string]any) []cache.ToolCall {
+	raw, ok := msg["tool_calls"].([]any)
+	if !ok {
+		return nil
+	}
+	var calls []cache.ToolCall
+	for _, item := range raw {
+		tc, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		var call cache.ToolCall
+		call.ID, _ = tc["id"].(string)
+		call.Type, _ = tc["type"].(string)
+		if fn, ok := tc["function"].(map[string]any); ok {
+			call.Function.Name, _ = fn["name"].(string)
+			switch v := fn["arguments"].(type) {
+			case string:
+				call.Function.Arguments = v
+			default:
+				// If it's an object or other type, marshal to JSON string.
+				if b, err := json.Marshal(v); err == nil {
+					call.Function.Arguments = string(b)
+				}
+			}
+		}
+		calls = append(calls, call)
+	}
+	return calls
+}
+
+// applyOverrides merges model-specific overrides into the request body.
+func applyOverrides(req map[string]any, overrides map[string]any) {
+	for k, v := range overrides {
+		req[k] = v
+	}
+}
+
+// normalizeThinking converts a consistent `thinking: true/false` override into
+// the provider-specific format expected by each model family.
+//
+// Supported families:
+//   - DeepSeek V4 / Reasoner: thinking: true  -> thinking: {"type": "enabled"}
+//   - DeepSeek V4 / Reasoner: thinking: false -> thinking: {"type": "disabled"}
+//   - Kimi K2.6:               thinking: true  -> thinking: {"type": "enabled"}
+//   - Kimi K2.6:               thinking: false -> thinking: {"type": "disabled"}
+//   - Qwen 3.7:                thinking: true  -> enable_thinking: true
+//   - Qwen 3.7:                thinking: false -> enable_thinking: false
+//
+// Provider-specific objects (e.g. thinking: {"type": "enabled"}) are passed
+// through unchanged, so power users can still set the raw upstream format.
+func normalizeThinking(req map[string]any, family family) {
+	thinking, ok := req["thinking"].(bool)
+	if !ok {
+		return
+	}
+
+	switch family {
+	case familyDeepSeekV4, familyDeepSeekReasoner, familyKimiK26, familyKimiK27:
+		if thinking {
+			req["thinking"] = map[string]any{"type": "enabled"}
+		} else {
+			req["thinking"] = map[string]any{"type": "disabled"}
+		}
+	case familyQwen37:
+		req["enable_thinking"] = thinking
+		delete(req, "thinking")
+	default:
+		// Unknown family: don't send a bare boolean that upstream may reject.
+		delete(req, "thinking")
+	}
+}
+
+// stripImageURLs removes image_url content items from messages when the target
+// model does not support vision. Text content is preserved.
+func stripImageURLs(req map[string]any, family family) {
+	if supportsVision(family) {
+		return
+	}
+
+	msgs, ok := req["messages"].([]any)
+	if !ok {
+		return
+	}
+
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		content, ok := msg["content"]
+		if !ok {
+			continue
+		}
+
+		switch v := content.(type) {
+		case []any:
+			filtered := make([]any, 0, len(v))
+			for _, item := range v {
+				part, ok := item.(map[string]any)
+				if !ok {
+					filtered = append(filtered, item)
+					continue
+				}
+				if t, _ := part["type"].(string); t == "image_url" {
+					continue
+				}
+				filtered = append(filtered, item)
+			}
+			if len(filtered) == 0 {
+				msg["content"] = ""
+			} else {
+				msg["content"] = filtered
+			}
+		}
+	}
+}
+
+// supportsVision returns true for model families that accept image_url content.
+func supportsVision(f family) bool {
+	switch f {
+	case familyKimiK26, familyKimiK27, familyQwen37:
+		return true
+	default:
+		return false
+	}
+}
+
+// isThinkingDisabled checks if thinking is disabled via overrides.
+// Returns true if:
+// - thinking: false at top level, OR
+// - thinking.type == "disabled" at top level, OR
+// - enable_thinking == false at top level (for Qwen)
+func isThinkingDisabled(req map[string]any) bool {
+	// Check thinking: false
+	if thinking, ok := req["thinking"].(bool); ok {
+		return !thinking
+	}
+
+	// Check thinking.type == "disabled"
+	if thinking, ok := req["thinking"].(map[string]any); ok {
+		if t, ok := thinking["type"].(string); ok && t == "disabled" {
+			return true
+		}
+	}
+
+	// Check enable_thinking == false (Qwen style)
+	if et, ok := req["enable_thinking"].(bool); ok && !et {
+		return true
+	}
+
+	return false
+}
+
+// isDeepSeekModel returns true if the model is a DeepSeek model that requires reasoning_content.
+func isDeepSeekModel(model string) bool {
+	family := detectFamily(model)
+	return family == familyDeepSeekV4 || family == familyDeepSeekReasoner
+}

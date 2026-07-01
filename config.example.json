@@ -1,0 +1,18 @@
+{
+  "models": {
+    "deepseek-v4-flash": {
+      "thinking": true,
+      "reasoning_effort": "max"
+    },
+    "deepseek-v4-pro": {
+      "thinking": true,
+      "reasoning_effort": "max"
+    },
+    "kimi-k2.6": {
+      "thinking": false
+    },
+    "qwen3.7-plus": {
+      "thinking": true
+    }
+  }
+}

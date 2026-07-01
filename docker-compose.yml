@@ -1,0 +1,20 @@
+services:
+  proxy:
+    build: .
+    image: android-studio-llm-proxy:latest
+    container_name: android-studio-llm-proxy
+    ports:
+      - "9999:9999"
+    environment:
+      # Optional overrides
+      - PORT=${PORT:-9999}
+      - UPSTREAM_URL=${UPSTREAM_URL:-https://opencode.ai/zen/go/v1}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - CACHE_TTL=${CACHE_TTL:-1h}
+      - CACHE_MAX_ENTRIES=${CACHE_MAX_ENTRIES:-1000}
+    volumes:
+      # Mount your local config directory into the container user's home.
+      # The proxy will create a default config.json on first run if one does not exist.
+      # Note: on Linux, ensure the host directory is writable by UID 1000.
+      - ${CONFIG_DIR:-${HOME}/.config/android-studio-llm-proxy}:/home/proxy/.config/android-studio-llm-proxy
+    restart: unless-stopped
