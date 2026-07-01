@@ -1,6 +1,7 @@
 package forward_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -239,5 +240,142 @@ func TestResponseWrittenCorrectly(t *testing.T) {
 	expected := `{"choices":[{"message":{"role":"assistant","content":"hi"}}]}`
 	if w.Body.String() != expected {
 		t.Errorf("body = %q, want %q", w.Body.String(), expected)
+	}
+}
+
+func TestProxy429LimitError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "42")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"type":"error","error":{"type":"RateLimitError","message":"Rate limit exceeded."}}`))
+	}))
+	defer upstream.Close()
+
+	fwd := forward.New(upstream.URL, nil)
+
+	req := httptest.NewRequest("POST", "/chat/completions", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+
+	fwd.Proxy(w, req, "/chat/completions", []byte(`{}`), false)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", w.Code)
+	}
+	if ra := w.Header().Get("Retry-After"); ra != "42" {
+		t.Errorf("retry-after = %q, want 42", ra)
+	}
+
+	var got struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if got.Error.Code != "rate_limit_exceeded" {
+		t.Errorf("code = %q, want rate_limit_exceeded", got.Error.Code)
+	}
+	if got.Error.Type != "rate_limit_error" {
+		t.Errorf("type = %q, want rate_limit_error", got.Error.Type)
+	}
+	if !strings.Contains(got.Error.Message, "Rate limit exceeded") {
+		t.Errorf("message = %q, want to contain 'Rate limit exceeded'", got.Error.Message)
+	}
+}
+
+func TestProxy429GoUsageLimitError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"type":"error","error":{"type":"GoUsageLimitError","message":"go usage limit reached"}}`))
+	}))
+	defer upstream.Close()
+
+	fwd := forward.New(upstream.URL, nil)
+
+	req := httptest.NewRequest("POST", "/chat/completions", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+
+	fwd.Proxy(w, req, "/chat/completions", []byte(`{}`), false)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", w.Code)
+	}
+
+	var got struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if got.Error.Code != "go_usage_limit_exceeded" {
+		t.Errorf("code = %q, want go_usage_limit_exceeded", got.Error.Code)
+	}
+}
+
+func TestProxy429UnrecognizedBody(t *testing.T) {
+	original := `{"message":"something else","code":"weird"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(original))
+	}))
+	defer upstream.Close()
+
+	fwd := forward.New(upstream.URL, nil)
+
+	req := httptest.NewRequest("POST", "/chat/completions", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+
+	fwd.Proxy(w, req, "/chat/completions", []byte(`{}`), false)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", w.Code)
+	}
+	if w.Body.String() != original {
+		t.Errorf("body = %q, want unchanged %q", w.Body.String(), original)
+	}
+}
+
+func TestProxy429StreamMode(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"type":"error","error":{"type":"FreeUsageLimitError","message":"free tier exhausted"}}`))
+	}))
+	defer upstream.Close()
+
+	fwd := forward.New(upstream.URL, nil)
+
+	req := httptest.NewRequest("POST", "/chat/completions", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+
+	// isStream=true, but 429 must still be transformed (not streamed).
+	fwd.Proxy(w, req, "/chat/completions", []byte(`{}`), true)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", w.Code)
+	}
+
+	var got struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if got.Error.Code != "free_usage_limit_exceeded" {
+		t.Errorf("code = %q, want free_usage_limit_exceeded", got.Error.Code)
+	}
+	if !strings.Contains(got.Error.Message, "free tier exhausted") {
+		t.Errorf("message = %q, want to contain 'free tier exhausted'", got.Error.Message)
 	}
 }

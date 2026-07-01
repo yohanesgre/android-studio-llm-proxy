@@ -52,6 +52,66 @@ func New(upstreamURL string, c cache.ReasoningCache) *Forwarder {
 	}
 }
 
+// opencodeError represents the error shape returned by OpenCode Go.
+type opencodeError struct {
+	Type  string `json:"type"`
+	Error struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// openAIError is the OpenAI-compatible error shape we emit to the client.
+type openAIError struct {
+	Error struct {
+		Message string  `json:"message"`
+		Type    string  `json:"type"`
+		Code    string  `json:"code"`
+		Param   *string `json:"param"`
+	} `json:"error"`
+}
+
+// mapOpenCodeErrorType maps an OpenCode error type to an OpenAI error code.
+func mapOpenCodeErrorType(t string) string {
+	switch t {
+	case "RateLimitError":
+		return "rate_limit_exceeded"
+	case "FreeUsageLimitError":
+		return "free_usage_limit_exceeded"
+	case "GoUsageLimitError":
+		return "go_usage_limit_exceeded"
+	case "BlackUsageLimitError":
+		return "black_usage_limit_exceeded"
+	default:
+		return "rate_limit_exceeded"
+	}
+}
+
+// transformLimitError attempts to parse body as an OpenCode limit error and
+// returns the OpenAI-compatible JSON. If the body is not a recognised OpenCode
+// error, it returns the original body unchanged and ok=false.
+func transformLimitError(body []byte) (out []byte, ok bool) {
+	var oe opencodeError
+	if err := json.Unmarshal(body, &oe); err != nil {
+		return body, false
+	}
+	if oe.Type != "error" || oe.Error.Type == "" {
+		return body, false
+	}
+
+	var ae openAIError
+	ae.Error.Message = oe.Error.Message
+	ae.Error.Type = "rate_limit_error"
+	ae.Error.Code = mapOpenCodeErrorType(oe.Error.Type)
+	ae.Error.Param = nil
+
+	encoded, err := json.Marshal(ae)
+	if err != nil {
+		return body, false
+	}
+	return encoded, true
+}
+
 // Proxy sends the request to the upstream path and writes the response to w.
 // For streaming responses, data is flushed chunk-by-chunk.
 func (f *Forwarder) Proxy(w http.ResponseWriter, r *http.Request, path string, body []byte, isStream bool) {
@@ -95,6 +155,37 @@ func (f *Forwarder) Proxy(w http.ResponseWriter, r *http.Request, path string, b
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
+
+	// Handle 429 limit errors from OpenCode Go: transform to OpenAI shape and
+	// return early (do not stream or cache).
+	if resp.StatusCode == http.StatusTooManyRequests {
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			slog.Error("forward: read 429 body", "error", err)
+			return
+		}
+		out, transformed := transformLimitError(data)
+		if _, werr := w.Write(out); werr != nil {
+			slog.Error("forward: write 429 response", "error", werr)
+		}
+		total := time.Since(start)
+		if transformed {
+			slog.Warn("upstream rate limited",
+				"url", upstreamURL,
+				"status", resp.StatusCode,
+				"first_byte_ms", float64(firstByte.Microseconds())/1000.0,
+				"total_ms", float64(total.Microseconds())/1000.0,
+			)
+		} else {
+			slog.Info("upstream",
+				"url", upstreamURL,
+				"status", resp.StatusCode,
+				"first_byte_ms", float64(firstByte.Microseconds())/1000.0,
+				"total_ms", float64(total.Microseconds())/1000.0,
+			)
+		}
+		return
+	}
 
 	if isStream {
 		f.streamResponse(w, resp.Body)
