@@ -1,0 +1,17 @@
+.git
+.github
+bin/
+dist/
+*.env
+.env.*
+config.json
+*.log
+ROADMAP.md
+README.md
+CONTRIBUTING.md
+LICENSE
+SECURITY.md
+Dockerfile
+Containerfile
+docker-compose.yml
+justfile

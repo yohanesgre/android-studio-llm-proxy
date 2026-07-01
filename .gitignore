@@ -1,0 +1,35 @@
+# Build artifacts
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+
+# Dependencies
+vendor/
+
+# Environment and config
+*.env
+.env.*
+config.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Private project notes (kept local only)
+ROADMAP.md
