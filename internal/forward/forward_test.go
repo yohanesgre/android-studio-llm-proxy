@@ -379,3 +379,168 @@ func TestProxy429StreamMode(t *testing.T) {
 		t.Errorf("message = %q, want to contain 'free tier exhausted'", got.Error.Message)
 	}
 }
+
+// writeRecorder wraps an http.ResponseWriter and records each Write call so
+// tests can verify that the proxy only writes complete SSE events.
+type writeRecorder struct {
+	http.ResponseWriter
+	writes [][]byte
+}
+
+func (w *writeRecorder) Write(b []byte) (int, error) {
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	w.writes = append(w.writes, cp)
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *writeRecorder) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func TestStreamForwardsCompleteEventsOnly(t *testing.T) {
+	c := cache.NewMemoryCache(time.Hour, 100)
+
+	sseEvent := "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello world\"}}]}\n\n"
+
+	// Upstream writes the event byte-by-byte with flushes to simulate
+	// worst-case fragmented network delivery.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for i := 0; i < len(sseEvent); i++ {
+			w.Write([]byte{sseEvent[i]})
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	fwd := forward.New(upstream.URL, c)
+
+	req := httptest.NewRequest("POST", "/chat/completions", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	wr := &writeRecorder{ResponseWriter: rec}
+
+	fwd.Proxy(wr, req, "/chat/completions", []byte(`{}`), true)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "hello world") {
+		t.Fatal("expected streamed content in response")
+	}
+
+	// Each Write call to the client must be a complete SSE event (ending with \n\n).
+	// This is the key assertion: the proxy must not forward partial events.
+	for i, w := range wr.writes {
+		if !strings.HasSuffix(string(w), "\n\n") {
+			t.Errorf("write %d is not a complete SSE event (missing trailing blank line): %q", i, w)
+		}
+	}
+
+	// Additionally verify every data: line contains valid JSON.
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		var js json.RawMessage
+		if err := json.Unmarshal([]byte(payload), &js); err != nil {
+			t.Errorf("data line is not valid JSON: %q, err: %v", line, err)
+		}
+	}
+}
+
+func TestStreamMultipleEvents(t *testing.T) {
+	c := cache.NewMemoryCache(time.Hour, 100)
+
+	sseData := "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking \"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"hard\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the answer\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte(sseData))
+	}))
+	defer upstream.Close()
+
+	fwd := forward.New(upstream.URL, c)
+
+	req := httptest.NewRequest("POST", "/chat/completions", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	wr := &writeRecorder{ResponseWriter: rec}
+
+	fwd.Proxy(wr, req, "/chat/completions", []byte(`{}`), true)
+
+	body := rec.Body.String()
+
+	// Content must be forwarded (as a coalesced synthetic event).
+	if !strings.Contains(body, "the answer") {
+		t.Errorf("response missing %q", "the answer")
+	}
+
+	// [DONE] must be forwarded.
+	if !strings.Contains(body, "[DONE]") {
+		t.Error("response missing [DONE]")
+	}
+
+	// reasoning_content events are NOT forwarded to the client.
+	if strings.Contains(body, "thinking ") {
+		t.Error("reasoning_content should not be forwarded to client")
+	}
+
+	// Each write must be a complete event.
+	for i, w := range wr.writes {
+		if !strings.HasSuffix(string(w), "\n\n") {
+			t.Errorf("write %d is not a complete SSE event: %q", i, w)
+		}
+	}
+
+	// Caching must still work.
+	got, ok := c.Find("the answer", nil)
+	if !ok {
+		t.Fatal("expected reasoning to be cached from stream")
+	}
+	if got != "thinking hard" {
+		t.Errorf("cached reasoning = %q, want %q", got, "thinking hard")
+	}
+}
+
+func TestStreamPartialEventAtEOF(t *testing.T) {
+	c := cache.NewMemoryCache(time.Hour, 100)
+
+	// Partial event: no trailing blank line, simulating an upstream that
+	// closes the connection mid-stream.
+	partialEvent := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte(partialEvent))
+		// No blank line — connection closes immediately.
+	}))
+	defer upstream.Close()
+
+	fwd := forward.New(upstream.URL, c)
+
+	req := httptest.NewRequest("POST", "/chat/completions", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+
+	fwd.Proxy(w, req, "/chat/completions", []byte(`{}`), true)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "partial") {
+		t.Fatal("expected partial event to be forwarded")
+	}
+	// The proxy must append \n\n so the event is properly terminated.
+	if !strings.HasSuffix(body, "\n\n") {
+		t.Errorf("expected trailing \\n\\n, got body ending %q", body[len(body)-min(10, len(body)):])
+	}
+
+	// Cache must not crash on partial data.
+	// (No reasoning_content in this event, so nothing should be cached.)
+}

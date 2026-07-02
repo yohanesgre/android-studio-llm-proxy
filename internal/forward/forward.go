@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/yohanesgre/android-studio-llm-proxy/internal/cache"
@@ -249,33 +248,181 @@ func (f *Forwarder) cacheNonStreamResponse(data []byte) {
 	}
 }
 
-// streamResponse reads from upstream SSE and flushes to the client.
+// streamResponse reads from upstream SSE, buffers complete events, coalesces
+// content-only events, and flushes them to the client. An SSE event is
+// terminated by a blank line (\n\n or \r\n\r\n). Content-only events (single
+// choice, no finish_reason, no reasoning_content, no tool_calls) are
+// accumulated and forwarded as a single synthetic event when a non-coalescable
+// event arrives or at EOF. Reasoning_content events are never forwarded but
+// are always accumulated for caching.
 func (f *Forwarder) streamResponse(w http.ResponseWriter, body io.Reader) {
 	flusher, canFlush := w.(http.Flusher)
-
-	// Use a pool of buffers for streaming.
-	buf := streamBufPool.Get().(*[]byte)
-	defer streamBufPool.Put(buf)
+	reader := bufio.NewReader(body)
 
 	// Accumulate SSE data for caching reasoning_content.
 	var sseAccum strings.Builder
+	var eventBuf strings.Builder
 
-	for {
-		n, err := body.Read(*buf)
-		if n > 0 {
-			chunk := (*buf)[:n]
-			if _, werr := w.Write(chunk); werr != nil {
-				slog.Error("forward: write stream chunk", "error", werr)
+	// Coalescing state: accumulate content-only deltas into a single event.
+	var pendingContent strings.Builder
+	var capturedRole string
+	isFirstCoalescable := true
+
+	writeToClient := func(data []byte) {
+		if _, werr := w.Write(data); werr != nil {
+			slog.Error("forward: write stream event", "error", werr)
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	flushPending := func() {
+		if pendingContent.Len() == 0 {
+			return
+		}
+		role := capturedRole
+		if role == "" {
+			role = "assistant"
+		}
+		synthetic := struct {
+			Choices []struct {
+				Index int `json:"index"`
+				Delta struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}{
+			Choices: []struct {
+				Index int `json:"index"`
+				Delta struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"delta"`
+			}{
+				{Index: 0, Delta: struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				}{Role: role, Content: pendingContent.String()}},
+			},
+		}
+		data, err := json.Marshal(synthetic)
+		if err != nil {
+			slog.Error("forward: marshal synthetic event", "error", err)
+			return
+		}
+		writeToClient(append([]byte("data: "), append(data, '\n', '\n')...))
+		pendingContent.Reset()
+	}
+
+	processEvent := func(event string) {
+		// Always accumulate raw event for caching.
+		if f.cache != nil {
+			sseAccum.WriteString(event)
+		}
+
+		// Extract the data line from the SSE event.
+		var dataLine string
+		for _, line := range strings.Split(strings.TrimRight(event, "\r\n"), "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				dataLine = strings.TrimPrefix(line, "data: ")
+			}
+		}
+
+		if dataLine == "" {
+			// No data line (comment or empty): flush pending and forward.
+			flushPending()
+			writeToClient([]byte(event))
+			return
+		}
+
+		if dataLine == "[DONE]" {
+			flushPending()
+			writeToClient([]byte(event))
+			return
+		}
+
+		// Parse the JSON payload.
+		var chunk struct {
+			Choices []struct {
+				Index        int        `json:"index"`
+				FinishReason *string    `json:"finish_reason"`
+				Delta        struct {
+					Role             *string    `json:"role"`
+					Content          *string    `json:"content"`
+					ReasoningContent *string    `json:"reasoning_content"`
+					ToolCalls        []toolCall `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(dataLine), &chunk); err != nil {
+			flushPending()
+			writeToClient([]byte(event))
+			return
+		}
+
+		// Check if this is a content-only event that can be coalesced.
+		if len(chunk.Choices) == 1 {
+			ch := chunk.Choices[0]
+			if ch.FinishReason == nil &&
+				ch.Delta.ReasoningContent == nil &&
+				len(ch.Delta.ToolCalls) == 0 &&
+				ch.Delta.Content != nil {
+				// Content-only: accumulate and skip forwarding.
+				if isFirstCoalescable && ch.Delta.Role != nil {
+					capturedRole = *ch.Delta.Role
+				}
+				isFirstCoalescable = false
+				pendingContent.WriteString(*ch.Delta.Content)
 				return
 			}
-			if canFlush {
-				flusher.Flush()
+		}
+
+		// Non-coalescable event: flush pending content first.
+		flushPending()
+
+		// Reasoning_content-only events are NOT forwarded to the client.
+		if len(chunk.Choices) == 1 {
+			ch := chunk.Choices[0]
+			if ch.Delta.ReasoningContent != nil &&
+				ch.Delta.Content == nil &&
+				len(ch.Delta.ToolCalls) == 0 &&
+				ch.FinishReason == nil {
+				return
 			}
-			if f.cache != nil {
-				sseAccum.Write(chunk)
+		}
+
+		// Forward the event unchanged.
+		writeToClient([]byte(event))
+	}
+
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			eventBuf.WriteString(line)
+			// A blank line (only \r\n or \n) marks the end of an SSE event.
+			if strings.TrimRight(line, "\r\n") == "" {
+				event := eventBuf.String()
+				processEvent(event)
+				eventBuf.Reset()
 			}
 		}
 		if err == io.EOF {
+			// Flush any partial event remaining in the buffer.
+			if eventBuf.Len() > 0 {
+				partial := eventBuf.String()
+				if !strings.HasSuffix(partial, "\n\n") {
+					if strings.HasSuffix(partial, "\n") {
+						partial += "\n"
+					} else {
+						partial += "\n\n"
+					}
+				}
+				processEvent(partial)
+			}
+			// Flush any remaining accumulated content.
+			flushPending()
 			break
 		}
 		if err != nil {
@@ -419,13 +566,6 @@ func convertToolCalls(tcs []toolCall) []cache.ToolCall {
 		out[i].Function.Arguments = tc.Function.Arguments
 	}
 	return out
-}
-
-var streamBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 4096)
-		return &b
-	},
 }
 
 // ProxyGet forwards a GET request (no body) to the upstream path.

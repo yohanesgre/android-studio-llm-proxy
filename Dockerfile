@@ -7,7 +7,7 @@ COPY go.mod ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=0.1.1" -o proxy ./cmd/proxy
+RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=0.1.2" -o proxy ./cmd/proxy
 
 FROM alpine:3.21
 

@@ -2,17 +2,19 @@ package sanitize_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yohanesgre/android-studio-llm-proxy/internal/cache"
+	"github.com/yohanesgre/android-studio-llm-proxy/internal/config"
 	"github.com/yohanesgre/android-studio-llm-proxy/internal/sanitize"
 )
 
 func mustSanitize(t *testing.T, body string) map[string]any {
 	t.Helper()
-	res, err := sanitize.Sanitize(strings.NewReader(body), nil, nil)
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, &config.Config{MaxContextMessages: 1000})
 	if err != nil {
 		t.Fatalf("sanitize error: %v", err)
 	}
@@ -25,7 +27,7 @@ func mustSanitize(t *testing.T, body string) map[string]any {
 
 func mustSanitizeWithCache(t *testing.T, body string, c cache.ReasoningCache) map[string]any {
 	t.Helper()
-	res, err := sanitize.Sanitize(strings.NewReader(body), c, nil)
+	res, err := sanitize.Sanitize(strings.NewReader(body), c, &config.Config{MaxContextMessages: 1000})
 	if err != nil {
 		t.Fatalf("sanitize error: %v", err)
 	}
@@ -38,7 +40,7 @@ func mustSanitizeWithCache(t *testing.T, body string, c cache.ReasoningCache) ma
 
 func mustSanitizeWithOverrides(t *testing.T, body string, overrides map[string]map[string]any) map[string]any {
 	t.Helper()
-	res, err := sanitize.Sanitize(strings.NewReader(body), nil, overrides)
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, &config.Config{Models: overrides, MaxContextMessages: 1000})
 	if err != nil {
 		t.Fatalf("sanitize error: %v", err)
 	}
@@ -170,7 +172,7 @@ func TestQwen37ParsesToolArguments(t *testing.T) {
 }
 
 func TestStreamFlagPreserved(t *testing.T) {
-	res, err := sanitize.Sanitize(strings.NewReader(`{"model":"gpt-4","messages":[],"stream":true}`), nil, nil)
+	res, err := sanitize.Sanitize(strings.NewReader(`{"model":"gpt-4","messages":[],"stream":true}`), nil, &config.Config{MaxContextMessages: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +180,7 @@ func TestStreamFlagPreserved(t *testing.T) {
 		t.Error("expected IsStream = true")
 	}
 
-	res2, err := sanitize.Sanitize(strings.NewReader(`{"model":"gpt-4","messages":[]}`), nil, nil)
+	res2, err := sanitize.Sanitize(strings.NewReader(`{"model":"gpt-4","messages":[]}`), nil, &config.Config{MaxContextMessages: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +190,7 @@ func TestStreamFlagPreserved(t *testing.T) {
 }
 
 func TestInvalidJSON(t *testing.T) {
-	_, err := sanitize.Sanitize(strings.NewReader(`{not json`), nil, nil)
+	_, err := sanitize.Sanitize(strings.NewReader(`{not json`), nil, &config.Config{MaxContextMessages: 1000})
 	if err == nil {
 		t.Error("expected error for invalid JSON")
 	}
@@ -571,5 +573,78 @@ func TestStripImageURLsLeavesEmptyString(t *testing.T) {
 	msg := msgs[0].(map[string]any)
 	if msg["content"] != "" {
 		t.Errorf("content = %v, want empty string", msg["content"])
+	}
+}
+
+func TestSanitizeTrimsOldMessages(t *testing.T) {
+	var msgs []string
+	for i := 0; i < 120; i++ {
+		msgs = append(msgs, fmt.Sprintf(`{"role":"user","content":"msg %d"}`, i))
+	}
+	body := fmt.Sprintf(`{"model":"gpt-4","messages":[%s]}`, strings.Join(msgs, ","))
+
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, &config.Config{MaxContextMessages: 100})
+	if err != nil {
+		t.Fatalf("sanitize error: %v", err)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(res.Body, &req); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	got := req["messages"].([]any)
+	if len(got) != 100 {
+		t.Fatalf("got %d messages, want 100", len(got))
+	}
+
+	// The oldest 20 (msg 0..19) should be dropped; first remaining should be msg 20.
+	first := got[0].(map[string]any)
+	if first["content"] != "msg 20" {
+		t.Errorf("first message content = %v, want msg 20", first["content"])
+	}
+	last := got[len(got)-1].(map[string]any)
+	if last["content"] != "msg 119" {
+		t.Errorf("last message content = %v, want msg 119", last["content"])
+	}
+}
+
+func TestSanitizePreservesSystemMessage(t *testing.T) {
+	msgs := []string{`{"role":"system","content":"you are a helpful assistant"}`}
+	for i := 0; i < 120; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		msgs = append(msgs, fmt.Sprintf(`{"role":"%s","content":"msg %d"}`, role, i))
+	}
+	body := fmt.Sprintf(`{"model":"gpt-4","messages":[%s]}`, strings.Join(msgs, ","))
+
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, &config.Config{MaxContextMessages: 100})
+	if err != nil {
+		t.Fatalf("sanitize error: %v", err)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(res.Body, &req); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	got := req["messages"].([]any)
+	if len(got) != 100 {
+		t.Fatalf("got %d messages, want 100", len(got))
+	}
+
+	// First message must be the system message.
+	first := got[0].(map[string]any)
+	if first["role"] != "system" {
+		t.Errorf("first role = %v, want system", first["role"])
+	}
+	if first["content"] != "you are a helpful assistant" {
+		t.Errorf("first content = %v, want system prompt", first["content"])
+	}
+
+	// Last message should be msg 119.
+	last := got[len(got)-1].(map[string]any)
+	if last["content"] != "msg 119" {
+		t.Errorf("last message content = %v, want msg 119", last["content"])
 	}
 }

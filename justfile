@@ -1,4 +1,4 @@
-VERSION := "0.1.1"
+VERSION := "0.1.2"
 
 build:
   go build -ldflags "-X main.version={{VERSION}}" -o bin/android-studio-llm-proxy ./cmd/proxy

@@ -70,6 +70,15 @@ func main() {
 		cfg.CacheMaxEntries = 1000
 	}
 
+	if v := os.Getenv("MAX_CONTEXT_MESSAGES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MaxContextMessages = n
+		}
+	}
+	if cfg.MaxContextMessages == 0 {
+		cfg.MaxContextMessages = 100
+	}
+
 	logLevel := slog.LevelInfo
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		switch strings.ToLower(v) {
@@ -97,6 +106,7 @@ func main() {
 		"port", cfg.Port,
 		"cache_ttl", cfg.CacheTTL,
 		"cache_max", cfg.CacheMaxEntries,
+		"max_context_messages", cfg.MaxContextMessages,
 		"model_overrides", len(cfg.Models),
 	)
 
@@ -118,10 +128,10 @@ func main() {
 
 	// Chat completions — sanitize then proxy.
 	mux.HandleFunc("POST /v1/chat/completions", withLogging(func(w http.ResponseWriter, r *http.Request) {
-		handleChat(w, r, fwd, reasoningCache, cfg.Models)
+		handleChat(w, r, fwd, reasoningCache, cfg)
 	}))
 	mux.HandleFunc("POST /chat/completions", withLogging(func(w http.ResponseWriter, r *http.Request) {
-		handleChat(w, r, fwd, reasoningCache, cfg.Models)
+		handleChat(w, r, fwd, reasoningCache, cfg)
 	}))
 
 	addr := ":" + cfg.Port
@@ -134,11 +144,11 @@ func main() {
 
 const maxRequestBodySize = 10 << 20 // 10 MiB
 
-func handleChat(w http.ResponseWriter, r *http.Request, fwd *forward.Forwarder, c cache.ReasoningCache, overrides config.ModelOverrides) {
+func handleChat(w http.ResponseWriter, r *http.Request, fwd *forward.Forwarder, c cache.ReasoningCache, cfg *config.Config) {
 	limited := http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	defer limited.Close()
 
-	res, err := sanitize.Sanitize(limited, c, overrides)
+	res, err := sanitize.Sanitize(limited, c, cfg)
 	if err != nil {
 		slog.Warn("sanitize failed", "error", err)
 		http.Error(w, "invalid request body", http.StatusBadRequest)

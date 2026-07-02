@@ -35,7 +35,7 @@ const deepSeekPlaceholderReasoning = "[reasoning not provided by upstream]"
 
 // Sanitize reads a chat-completion request body, applies model-specific
 // sanitization rules, and returns the cleaned body.
-func Sanitize(r io.Reader, c cache.ReasoningCache, overrides config.ModelOverrides) (*Result, error) {
+func Sanitize(r io.Reader, c cache.ReasoningCache, cfg *config.Config) (*Result, error) {
 	start := time.Now()
 	var req map[string]any
 	if err := json.NewDecoder(r).Decode(&req); err != nil {
@@ -58,13 +58,18 @@ func Sanitize(r io.Reader, c cache.ReasoningCache, overrides config.ModelOverrid
 		}
 	}
 
+	// Trim oldest messages if exceeding MaxContextMessages.
+	if cfg != nil && cfg.MaxContextMessages > 0 {
+		trimMessages(req, cfg.MaxContextMessages)
+	}
+
 	// Detect model family and apply rules.
 	model, _ := req["model"].(string)
 	family := detectFamily(model)
 
 	// Apply per-model overrides BEFORE family rules.
-	if overrides != nil {
-		if modelOverrides, ok := overrides[model]; ok {
+	if cfg != nil && cfg.Models != nil {
+		if modelOverrides, ok := cfg.Models[model]; ok {
 			applyOverrides(req, modelOverrides)
 		}
 	}
@@ -102,6 +107,39 @@ func Sanitize(r io.Reader, c cache.ReasoningCache, overrides config.ModelOverrid
 }
 
 type family int
+
+// trimMessages trims the oldest non-system messages when the total count exceeds max.
+// If the first message has role "system", it is preserved and the most recent max-1 messages are kept.
+// Otherwise, the most recent max messages are kept.
+func trimMessages(req map[string]any, max int) {
+	msgs, ok := req["messages"].([]any)
+	if !ok || len(msgs) <= max {
+		return
+	}
+
+	hasSystem := false
+	if first, ok := msgs[0].(map[string]any); ok {
+		if role, ok := first["role"].(string); ok && role == "system" {
+			hasSystem = true
+		}
+	}
+
+	if hasSystem {
+		system := msgs[0]
+		keep := max - 1
+		if keep < 0 {
+			keep = 0
+		}
+		trimmed := make([]any, 0, 1+keep)
+		trimmed = append(trimmed, system)
+		if keep > 0 {
+			trimmed = append(trimmed, msgs[len(msgs)-keep:]...)
+		}
+		req["messages"] = trimmed
+	} else {
+		req["messages"] = msgs[len(msgs)-max:]
+	}
+}
 
 const (
 	familyUnknown family = iota
