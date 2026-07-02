@@ -79,6 +79,21 @@ func main() {
 		cfg.MaxContextMessages = 100
 	}
 
+	if v := os.Getenv("MAX_CONTEXT_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MaxContextTokens = n
+		}
+	}
+	if cfg.MaxContextTokens == 0 {
+		cfg.MaxContextTokens = 65536 // 64K, safe for most models
+	}
+
+	if v := os.Getenv("MAX_COMPLETION_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MaxCompletionTokens = n
+		}
+	}
+
 	logLevel := slog.LevelInfo
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		switch strings.ToLower(v) {
@@ -107,6 +122,8 @@ func main() {
 		"cache_ttl", cfg.CacheTTL,
 		"cache_max", cfg.CacheMaxEntries,
 		"max_context_messages", cfg.MaxContextMessages,
+		"max_context_tokens", cfg.MaxContextTokens,
+		"max_completion_tokens", cfg.MaxCompletionTokens,
 		"model_overrides", len(cfg.Models),
 	)
 
@@ -154,6 +171,11 @@ func handleChat(w http.ResponseWriter, r *http.Request, fwd *forward.Forwarder, 
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+
+	slog.Debug("sanitized request",
+		"body", truncate(string(res.Body), 2000),
+		"stream", res.IsStream,
+	)
 
 	fwd.Proxy(w, r, forward.ChatPath, res.Body, res.IsStream)
 }
@@ -210,4 +232,12 @@ func withLogging(next http.HandlerFunc) http.HandlerFunc {
 			)
 		}
 	}
+}
+
+// truncate returns s truncated to maxLen characters plus "..." suffix.
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }

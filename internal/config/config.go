@@ -25,14 +25,16 @@ type ModelOverrides map[string]map[string]any
 
 // Config holds the proxy configuration.
 type Config struct {
-	Path               string
-	Created            bool
-	UpstreamURL        string
-	Port               string
-	CacheTTL           time.Duration
-	CacheMaxEntries    int
-	Models             ModelOverrides
-	MaxContextMessages int
+	Path                string
+	Created             bool
+	UpstreamURL         string
+	Port                string
+	CacheTTL            time.Duration
+	CacheMaxEntries     int
+	Models              ModelOverrides
+	MaxContextMessages  int
+	MaxContextTokens    int
+	MaxCompletionTokens int
 }
 
 // Load reads configuration from the config file and environment variables.
@@ -73,8 +75,10 @@ func Load() (*Config, error) {
 	}
 
 	var raw struct {
-		Models             map[string]map[string]any `json:"models"`
-		MaxContextMessages int                       `json:"max_context_messages,omitempty"`
+		Models              map[string]map[string]any `json:"models"`
+		MaxContextMessages  int                       `json:"max_context_messages,omitempty"`
+		MaxContextTokens    int                       `json:"max_context_tokens,omitempty"`
+		MaxCompletionTokens int                       `json:"max_completion_tokens,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("config: invalid JSON: %w", err)
@@ -84,6 +88,8 @@ func Load() (*Config, error) {
 		cfg.Models = raw.Models
 	}
 	cfg.MaxContextMessages = raw.MaxContextMessages
+	cfg.MaxContextTokens = raw.MaxContextTokens
+	cfg.MaxCompletionTokens = raw.MaxCompletionTokens
 
 	return cfg, nil
 }

@@ -40,7 +40,7 @@ apple-container-run:
   container delete -f android-studio-llm-proxy || true
   container run --rm -p 9999:9999 --name android-studio-llm-proxy \
     -v ${HOME}/.config/android-studio-llm-proxy:/home/proxy/.config/android-studio-llm-proxy \
-    android-studio-llm-proxy:{{VERSION}}
+    android-studio-llm-proxy:{{VERSION}} &
 
 # Run with docker-compose
 compose-up:

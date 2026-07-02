@@ -144,9 +144,11 @@ func (f *Forwarder) Proxy(w http.ResponseWriter, r *http.Request, path string, b
 	defer resp.Body.Close()
 	firstByte := time.Since(start)
 
-	// Copy response headers, stripping hop-by-hop and sensitive headers.
+	// Copy response headers, stripping hop-by-hop headers, Content-Length
+	// (the proxy may modify body content, making upstream Content-Length invalid),
+	// and other sensitive headers.
 	for k, vv := range resp.Header {
-		if isHopByHopHeader(k) {
+		if isHopByHopHeader(k) || k == "Content-Length" {
 			continue
 		}
 		for _, v := range vv {
@@ -155,33 +157,46 @@ func (f *Forwarder) Proxy(w http.ResponseWriter, r *http.Request, path string, b
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	// Handle 429 limit errors from OpenCode Go: transform to OpenAI shape and
-	// return early (do not stream or cache).
-	if resp.StatusCode == http.StatusTooManyRequests {
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			slog.Error("forward: read 429 body", "error", err)
+	// For error responses, read the body and log it for debugging.
+	if resp.StatusCode >= 400 {
+		data, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			slog.Error("forward: read error body", "error", readErr, "status", resp.StatusCode)
 			return
 		}
-		out, transformed := transformLimitError(data)
-		if _, werr := w.Write(out); werr != nil {
-			slog.Error("forward: write 429 response", "error", werr)
+
+		bodyPreview := string(data)
+		if len(bodyPreview) > 2000 {
+			bodyPreview = bodyPreview[:2000] + "..."
 		}
-		total := time.Since(start)
-		if transformed {
-			slog.Warn("upstream rate limited",
-				"url", upstreamURL,
-				"status", resp.StatusCode,
-				"first_byte_ms", float64(firstByte.Microseconds())/1000.0,
-				"total_ms", float64(total.Microseconds())/1000.0,
-			)
-		} else {
-			slog.Info("upstream",
-				"url", upstreamURL,
-				"status", resp.StatusCode,
-				"first_byte_ms", float64(firstByte.Microseconds())/1000.0,
-				"total_ms", float64(total.Microseconds())/1000.0,
-			)
+		slog.Error("forward: upstream error",
+			"url", upstreamURL,
+			"status", resp.StatusCode,
+			"method", r.Method,
+			"body", bodyPreview,
+		)
+
+		// 429: transform to OpenAI-compatible error shape.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			out, transformed := transformLimitError(data)
+			if _, werr := w.Write(out); werr != nil {
+				slog.Error("forward: write 429 response", "error", werr)
+			}
+			total := time.Since(start)
+			if transformed {
+				slog.Warn("upstream rate limited",
+					"url", upstreamURL,
+					"status", resp.StatusCode,
+					"first_byte_ms", float64(firstByte.Microseconds())/1000.0,
+					"total_ms", float64(total.Microseconds())/1000.0,
+				)
+			}
+			return
+		}
+
+		// Other errors: forward as-is.
+		if _, werr := w.Write(data); werr != nil {
+			slog.Error("forward: write error body", "error", werr)
 		}
 		return
 	}

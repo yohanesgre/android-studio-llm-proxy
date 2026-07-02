@@ -31,7 +31,32 @@ type Result struct {
 	IsStream bool
 }
 
-const deepSeekPlaceholderReasoning = "[reasoning not provided by upstream]"
+// estimateTokens returns a rough token count for a string using 4 chars/token heuristic.
+// This is deliberately imprecise — good enough for context-budget enforcement.
+func estimateTokens(s string) int {
+	return len([]rune(s)) / 4
+}
+
+// estimateMessageTokens returns an estimated token count for a message map.
+// Includes ~4 tokens overhead for message metadata (role, etc.).
+func estimateMessageTokens(m any) int {
+	msg, ok := m.(map[string]any)
+	if !ok {
+		return 4
+	}
+	tokens := 4 // message overhead
+	if content, ok := msg["content"].(string); ok {
+		tokens += estimateTokens(content)
+	}
+	if rc, ok := msg["reasoning_content"].(string); ok {
+		tokens += estimateTokens(rc)
+	}
+	// Tool calls add nominal overhead.
+	if tcs, ok := msg["tool_calls"].([]any); ok {
+		tokens += len(tcs) * 20
+	}
+	return tokens
+}
 
 // Sanitize reads a chat-completion request body, applies model-specific
 // sanitization rules, and returns the cleaned body.
@@ -58,13 +83,21 @@ func Sanitize(r io.Reader, c cache.ReasoningCache, cfg *config.Config) (*Result,
 		}
 	}
 
-	// Trim oldest messages if exceeding MaxContextMessages.
-	if cfg != nil && cfg.MaxContextMessages > 0 {
-		trimMessages(req, cfg.MaxContextMessages)
-	}
-
 	// Detect model family and apply rules.
 	model, _ := req["model"].(string)
+
+	// Apply context budget: token-based (preferred) or message-count fallback.
+	// Per-model overrides take precedence over global config.
+	if cfg != nil {
+		if maxTokens := resolveMaxContextTokens(cfg, model); maxTokens > 0 {
+			trimByTokens(req, maxTokens)
+		} else if cfg.MaxContextMessages > 0 {
+			trimMessages(req, cfg.MaxContextMessages)
+		}
+	}
+
+	// Inject max_completion_tokens if not set by the client.
+	injectMaxCompletionTokens(req, cfg, model)
 	family := detectFamily(model)
 
 	// Apply per-model overrides BEFORE family rules.
@@ -139,6 +172,107 @@ func trimMessages(req map[string]any, max int) {
 	} else {
 		req["messages"] = msgs[len(msgs)-max:]
 	}
+}
+
+// trimByTokens trims oldest non-system messages until the total estimated tokens
+// is within maxTokens. The system message at position 0 is always preserved.
+func trimByTokens(req map[string]any, maxTokens int) {
+	msgs, ok := req["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return
+	}
+
+	// Check if first message is system.
+	preserveSystem := false
+	if first, ok := msgs[0].(map[string]any); ok {
+		if role, _ := first["role"].(string); role == "system" {
+			preserveSystem = true
+		}
+	}
+
+	// Walk from newest to oldest, collecting messages that fit.
+	remaining := maxTokens
+
+	if preserveSystem {
+		sysTokens := estimateMessageTokens(msgs[0])
+		if sysTokens >= remaining {
+			// System message alone exceeds budget — keep it anyway as minimum.
+			req["messages"] = []any{msgs[0]}
+			return
+		}
+		remaining -= sysTokens
+	}
+
+	start := 0
+	if preserveSystem {
+		start = 1
+	}
+
+	var kept []any
+	for i := len(msgs) - 1; i >= start; i-- {
+		t := estimateMessageTokens(msgs[i])
+		if t <= remaining {
+			kept = append(kept, msgs[i])
+			remaining -= t
+		} else {
+			// If we can't fit even the most recent, keep it anyway.
+			if len(kept) == 0 {
+				kept = append(kept, msgs[i])
+			}
+			break
+		}
+	}
+
+	// Reverse to maintain chronological order.
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
+	}
+
+	if preserveSystem {
+		result := make([]any, 0, 1+len(kept))
+		result = append(result, msgs[0])
+		result = append(result, kept...)
+		req["messages"] = result
+	} else {
+		req["messages"] = kept
+	}
+}
+
+// resolveMaxContextTokens returns the effective max_context_tokens budget for a model.
+// Per-model overrides take precedence over global config, then 0 (disabled).
+func resolveMaxContextTokens(cfg *config.Config, model string) int {
+	if cfg.Models != nil {
+		if overrides, ok := cfg.Models[model]; ok {
+			if v, ok := overrides["max_context_tokens"]; ok {
+				if n, ok := v.(float64); ok && n > 0 {
+					return int(n)
+				}
+			}
+		}
+	}
+	return cfg.MaxContextTokens
+}
+
+// injectMaxCompletionTokens sets max_completion_tokens in the request if absent
+// AND the user has explicitly configured a limit. Only injects for DeepSeek models.
+// No default is applied — unbounded generation is the model's responsibility
+// unless the user opts in via config.
+func injectMaxCompletionTokens(req map[string]any, cfg *config.Config, model string) {
+	// Already set (by client or per-model override from applyOverrides) — respect it.
+	if _, ok := req["max_completion_tokens"]; ok {
+		return
+	}
+
+	family := detectFamily(model)
+	if family != familyDeepSeekV4 && family != familyDeepSeekReasoner {
+		return
+	}
+
+	// Only inject when user explicitly configured a limit.
+	if cfg == nil || cfg.MaxCompletionTokens <= 0 {
+		return
+	}
+	req["max_completion_tokens"] = cfg.MaxCompletionTokens
 }
 
 const (
@@ -292,19 +426,15 @@ func injectReasoning(req map[string]any, c cache.ReasoningCache, model string) {
 
 		reasoning, found := c.Find(content, toolCalls)
 		if !found {
+			slog.Debug("reasoning_content not in cache",
+				"model", model,
+				"content_len", len(content),
+				"has_tool_calls", len(toolCalls) > 0,
+			)
+			// DeepSeek requires reasoning_content on assistant messages for multi-turn.
+			// Use a minimal bracket-framed placeholder to satisfy API format validation.
 			if isDeepSeekModel(model) {
-				slog.Warn("injecting placeholder reasoning_content for DeepSeek",
-					"model", model,
-					"content_len", len(content),
-					"has_tool_calls", len(toolCalls) > 0,
-				)
-				msg["reasoning_content"] = deepSeekPlaceholderReasoning
-			} else {
-				slog.Warn("reasoning_content missing and not in cache",
-					"model", model,
-					"content_len", len(content),
-					"has_tool_calls", len(toolCalls) > 0,
-				)
+				msg["reasoning_content"] = "[...]"
 			}
 			continue
 		}

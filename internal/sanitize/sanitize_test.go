@@ -411,7 +411,7 @@ func TestQwen37DisabledThinkingPreservesToolChoice(t *testing.T) {
 	}
 }
 
-func TestDeepSeekV4PlaceholderInjected(t *testing.T) {
+func TestDeepSeekV4MinimalPlaceholderOnCacheMiss(t *testing.T) {
 	c := cache.NewMemoryCache(time.Hour, 100)
 	// Cache is empty, so no hit.
 
@@ -421,14 +421,14 @@ func TestDeepSeekV4PlaceholderInjected(t *testing.T) {
 	msg := msgs[0].(map[string]any)
 	rc, ok := msg["reasoning_content"].(string)
 	if !ok {
-		t.Fatal("expected reasoning_content to be injected for DeepSeek V4")
+		t.Fatal("expected minimal reasoning_content placeholder for DeepSeek")
 	}
-	if rc != "[reasoning not provided by upstream]" {
-		t.Errorf("reasoning_content = %v, want placeholder", rc)
+	if rc != "[...]" {
+		t.Errorf("reasoning_content = %q, want placeholder '[...]'", rc)
 	}
 }
 
-func TestDeepSeekReasonerPlaceholderInjected(t *testing.T) {
+func TestDeepSeekReasonerMinimalPlaceholderOnCacheMiss(t *testing.T) {
 	c := cache.NewMemoryCache(time.Hour, 100)
 	// Cache is empty, so no hit.
 
@@ -438,10 +438,10 @@ func TestDeepSeekReasonerPlaceholderInjected(t *testing.T) {
 	msg := msgs[0].(map[string]any)
 	rc, ok := msg["reasoning_content"].(string)
 	if !ok {
-		t.Fatal("expected reasoning_content to be injected for DeepSeek Reasoner")
+		t.Fatal("expected minimal reasoning_content placeholder for DeepSeek Reasoner")
 	}
-	if rc != "[reasoning not provided by upstream]" {
-		t.Errorf("reasoning_content = %v, want placeholder", rc)
+	if rc != "[...]" {
+		t.Errorf("reasoning_content = %q, want placeholder '[...]'", rc)
 	}
 }
 
@@ -605,6 +605,161 @@ func TestSanitizeTrimsOldMessages(t *testing.T) {
 	last := got[len(got)-1].(map[string]any)
 	if last["content"] != "msg 119" {
 		t.Errorf("last message content = %v, want msg 119", last["content"])
+	}
+}
+
+func TestMaxCompletionTokensInjectedWhenConfigured(t *testing.T) {
+	body := `{"model":"deepseek-v4-flash","messages":[]}`
+	req := mustSanitizeWithOverrides(t, body, nil)
+	// No default injection — only when user explicitly configures.
+	if _, ok := req["max_completion_tokens"]; ok {
+		t.Error("max_completion_tokens should not be injected without explicit config")
+	}
+}
+
+func TestMaxCompletionTokensInjectedWithExplicitConfig(t *testing.T) {
+	body := `{"model":"deepseek-v4-flash","messages":[]}`
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, &config.Config{MaxCompletionTokens: 8192})
+	if err != nil {
+		t.Fatalf("sanitize error: %v", err)
+	}
+	var req map[string]any
+	json.Unmarshal(res.Body, &req)
+	mct, ok := req["max_completion_tokens"]
+	if !ok {
+		t.Fatal("expected max_completion_tokens to be injected when explicitly configured")
+	}
+	if mct != float64(8192) {
+		t.Errorf("max_completion_tokens = %v, want 8192", mct)
+	}
+}
+
+func TestMaxCompletionTokensNotInjectedForNonDeepSeek(t *testing.T) {
+	body := `{"model":"kimi-k2.7","messages":[]}`
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, &config.Config{MaxCompletionTokens: 4096})
+	if err != nil {
+		t.Fatalf("sanitize error: %v", err)
+	}
+	var req map[string]any
+	json.Unmarshal(res.Body, &req)
+	if _, ok := req["max_completion_tokens"]; ok {
+		t.Error("max_completion_tokens should not be injected for non-DeepSeek models")
+	}
+}
+
+func TestMaxCompletionTokensRespectsExisting(t *testing.T) {
+	body := `{"model":"deepseek-v4-flash","messages":[],"max_completion_tokens":16384}`
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, &config.Config{MaxCompletionTokens: 8192})
+	if err != nil {
+		t.Fatalf("sanitize error: %v", err)
+	}
+	var req map[string]any
+	json.Unmarshal(res.Body, &req)
+	mct, ok := req["max_completion_tokens"]
+	if !ok {
+		t.Fatal("expected max_completion_tokens to be preserved")
+	}
+	// Client's own value takes precedence over config default.
+	if mct != float64(16384) {
+		t.Errorf("max_completion_tokens = %v, want 16384", mct)
+	}
+}
+
+func TestSanitizeTrimsByTokens(t *testing.T) {
+	var msgs []string
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, fmt.Sprintf(`{"role":"user","content":"%s"}`, strings.Repeat("x", 80)))
+	}
+	body := fmt.Sprintf(`{"model":"gpt-4","messages":[%s]}`, strings.Join(msgs, ","))
+
+	// Each message: ~4 overhead + 20 tokens (80 chars/4) = ~24 tokens.
+	// Budget 100 tokens should trim significantly.
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, &config.Config{MaxContextTokens: 100})
+	if err != nil {
+		t.Fatalf("sanitize error: %v", err)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(res.Body, &req); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	got := req["messages"].([]any)
+	if len(got) >= 30 {
+		t.Errorf("expected messages to be trimmed by token budget, got %d", len(got))
+	}
+	if len(got) == 0 {
+		t.Fatal("expected at least one message to remain")
+	}
+	// Most recent message should be preserved.
+	last := got[len(got)-1].(map[string]any)
+	if last["content"] != strings.Repeat("x", 80) {
+		t.Errorf("last message content = %v, want msg 29 (80 x's)", last["content"])
+	}
+}
+
+// TestPerModelMaxContextTokens verifies per-model override takes precedence over global.
+func TestPerModelMaxContextTokens(t *testing.T) {
+	var msgs []string
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, fmt.Sprintf(`{"role":"user","content":"%s"}`, strings.Repeat("x", 80)))
+	}
+	body := fmt.Sprintf(`{"model":"test-model-x","messages":[%s]}`, strings.Join(msgs, ","))
+
+	cfg := &config.Config{
+		MaxContextTokens: 100, // global: should keep ~4 messages
+		Models: config.ModelOverrides{
+			"test-model-x": {
+				"max_context_tokens": float64(10), // per-model: should keep 0-1 messages
+			},
+		},
+	}
+
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, cfg)
+	if err != nil {
+		t.Fatalf("sanitize error: %v", err)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(res.Body, &req); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	got := req["messages"].([]any)
+
+	// With per-model max=10 tokens, and each message ~24 tokens, most should be dropped.
+	// Even the most recent message (24 tokens) won't fit 10, but trimByTokens
+	// keeps at least the last message.
+	if len(got) >= 2 {
+		t.Errorf("per-model override (10 tokens) should trim more aggressively than global (100), got %d messages", len(got))
+	}
+	if len(got) == 0 {
+		t.Fatal("expected at least one message to remain")
+	}
+}
+
+func TestSanitizePreservesSystemMessageWithTokenTrim(t *testing.T) {
+	msgs := []string{`{"role":"system","content":"you are a helpful assistant"}`}
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, fmt.Sprintf(`{"role":"user","content":"%s"}`, strings.Repeat("x", 80)))
+	}
+	body := fmt.Sprintf(`{"model":"gpt-4","messages":[%s]}`, strings.Join(msgs, ","))
+
+	res, err := sanitize.Sanitize(strings.NewReader(body), nil, &config.Config{MaxContextTokens: 200})
+	if err != nil {
+		t.Fatalf("sanitize error: %v", err)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(res.Body, &req); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	got := req["messages"].([]any)
+	if len(got) == 0 {
+		t.Fatal("expected at least one message")
+	}
+	// First message must be the system message.
+	first := got[0].(map[string]any)
+	if first["role"] != "system" {
+		t.Errorf("first role = %v, want system", first["role"])
+	}
+	if first["content"] != "you are a helpful assistant" {
+		t.Errorf("first content = %v, want system prompt", first["content"])
 	}
 }
 
